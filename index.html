@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ASCENZA — Demo: Drawing Compliance QuickCheck</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root{--bg:#0f1724;--card:#0b1220;--muted:#94a3b8;--accent:#4f46e5;--success:#16a34a;--danger:#ef4444;--glass:rgba(255,255,255,0.03)}
+    *{box-sizing:border-box;font-family:Inter,system-ui,Segoe UI,Roboto,"Helvetica Neue",Arial}
+    body{margin:0;background:linear-gradient(180deg,#071028 0%, #071a2b 100%);color:#e6eef8;min-height:100vh;padding:36px}
+    .container{max-width:1100px;margin:0 auto}
+    header{display:flex;align-items:center;gap:16px;margin-bottom:22px}
+    .logo{width:52px;height:52px;background:linear-gradient(135deg,var(--accent),#00c2ff);border-radius:12px;display:flex;align-items:center;justify-content:center;font-weight:700;color:white}
+    h1{margin:0;font-size:20px}
+    p.lead{color:var(--muted);margin:6px 0 18px}
+    .grid{display:grid;grid-template-columns:1fr 420px;gap:20px}
+    .card{background:var(--card);padding:18px;border-radius:12px;box-shadow:0 6px 20px rgba(2,6,23,0.6)}
+    .file-drop{border:1px dashed rgba(255,255,255,0.06);padding:18px;border-radius:10px;display:flex;flex-direction:column;gap:10px}
+    .btn{background:linear-gradient(90deg,var(--accent),#00c2ff);border:none;padding:10px 14px;border-radius:8px;color:white;font-weight:600;cursor:pointer}
+    .muted{color:var(--muted);font-size:13px}
+    img.preview{max-width:100%;border-radius:8px;display:block;margin-top:10px}
+    pre{background:var(--glass);padding:10px;border-radius:8px;overflow:auto}
+    .badge{display:inline-block;padding:6px 10px;border-radius:999px;font-weight:600}
+    .green{background:rgba(22,163,74,0.12);color:var(--success)}
+    .red{background:rgba(239,68,68,0.12);color:var(--danger)}
+    .yellow{background:rgba(250,204,21,0.06);color:#f59e0b}
+    .flex-row{display:flex;gap:10px;align-items:center}
+    label{font-size:13px;color:var(--muted)}
+    textarea{width:100%;min-height:90px;background:transparent;border:1px solid rgba(255,255,255,0.04);color:inherit;padding:10px;border-radius:8px}
+    .field{margin-bottom:10px}
+    .results {margin-top:12px}
+    .rule-item{display:flex;justify-content:space-between;padding:10px;border-bottom:1px dashed rgba(255,255,255,0.02)}
+    footer{margin-top:22px;color:var(--muted);font-size:13px}
+  </style>
+  <!-- Tesseract.js (browser OCR) -->
+  <script src="https://unpkg.com/tesseract.js@2.1.5/dist/tesseract.min.js"></script>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="logo">A</div>
+      <div>
+        <h1>ASCENZA — Drawing Compliance QuickCheck (Demo)</h1>
+        <p class="lead">Upload a drawing image and a small compliance checklist (or paste NBC text). Demo extracts title-block text, runs quick rule checks and shows flagged items.</p>
+      </div>
+    </header>
+
+    <div class="grid">
+      <!-- LEFT: Inputs & demo -->
+      <div class="card">
+        <h3>1) Upload drawing</h3>
+        <div class="file-drop">
+          <input id="fileInput" type="file" accept="image/*,.pdf"/>
+          <div class="muted">Prefer PNG/JPG for the quick demo (PDF support later with pdf.js). Drop an exported sheet image.</div>
+          <img id="preview" class="preview" style="display:none"/>
+          <div id="ocrStatus" class="muted">No OCR yet.</div>
+          <button id="runOcr" class="btn" style="width:180px;margin-top:8px">Run OCR & Check</button>
+        </div>
+
+        <hr style="margin:12px 0;border-color:rgba(255,255,255,0.03)">
+
+        <h3>2) Compliance rules (paste or use preset)</h3>
+        <div class="field">
+          <label class="muted">You can paste important NBC clauses, or a short checklist. Demo will turn lines into keyword checks:</label>
+          <textarea id="rulesText" placeholder="Example: North arrow; Scale (1:100); Corridor width >= 900; Fire exit shown"></textarea>
+          <div style="margin-top:8px" class="flex-row">
+            <button id="useSample" class="btn">Load sample rules</button>
+            <div class="muted" style="margin-left:auto">Rules -> simple keyword/regex checks</div>
+          </div>
+        </div>
+
+        <hr style="margin:12px 0;border-color:rgba(255,255,255,0.03)">
+
+        <h3>3) Title-block edits (simulate batch update)</h3>
+        <div class="field">
+          <label class="muted">Detected title block fields:</label>
+          <pre id="titleBlockJson">{ }</pre>
+        </div>
+
+        <div style="display:flex;gap:8px">
+          <input id="tbProject" placeholder="Project name" style="flex:1;padding:8px;border-radius:8px;background:transparent;border:1px solid rgba(255,255,255,0.04)"/>
+          <input id="tbRev" placeholder="Rev" style="width:80px;padding:8px;border-radius:8px;background:transparent;border:1px solid rgba(255,255,255,0.04)"/>
+          <button id="applyTB" class="btn">Simulate Update</button>
+        </div>
+
+        <div id="downloadAnchor" style="margin-top:10px"></div>
+
+      </div>
+
+      <!-- RIGHT: Results -->
+      <div class="card">
+        <h3>QuickCheck results</h3>
+        <div id="summary" style="margin-bottom:10px">
+          <div class="muted">No checks run yet.</div>
+        </div>
+        <div class="results" id="ruleResults"></div>
+
+        <hr style="margin:12px 0;border-color:rgba(255,255,255,0.03)">
+
+        <h4>OCR extracted text (preview)</h4>
+        <pre id="ocrText" style="height:220px;overflow:auto">{ }</pre>
+      </div>
+    </div>
+
+    <footer>
+      <div style="margin-top:14px">Notes: this is a **demo**. For production we replace client OCR with server worker / commercial OCR, add DWG parsing (Forge) and a rules-engine that maps NBC to JSON checks. Need help deploying this? Ask and I'll give exact Netlify / GitHub Pages steps.</div>
+    </footer>
+  </div>
+
+<script>
+  // Simple demo logic: OCR with Tesseract, extract title block keywords and run basic rules
+  const fileInput = document.getElementById('fileInput');
+  const preview = document.getElementById('preview');
+  const runOcrBtn = document.getElementById('runOcr');
+  const ocrTextPre = document.getElementById('ocrText');
+  const ocrStatus = document.getElementById('ocrStatus');
+  const rulesText = document.getElementById('rulesText');
+  const useSample = document.getElementById('useSample');
+  const ruleResults = document.getElementById('ruleResults');
+  const summary = document.getElementById('summary');
+  const titleBlockJson = document.getElementById('titleBlockJson');
+  const tbProject = document.getElementById('tbProject');
+  const tbRev = document.getElementById('tbRev');
+  const applyTB = document.getElementById('applyTB');
+  const downloadAnchor = document.getElementById('downloadAnchor');
+
+  let lastOCR = '';
+
+  useSample.addEventListener('click', ()=>{
+    rulesText.value = `North arrow
+Scale 1:100
+Corridor width >= 900
+Fire exit
+Toilet plan
+Parking layout`;
+  });
+
+  fileInput.addEventListener('change', (ev)=>{
+    const f = ev.target.files[0];
+    if(!f) return;
+    const url = URL.createObjectURL(f);
+    preview.src = url;
+    preview.style.display = 'block';
+  });
+
+  runOcrBtn.addEventListener('click', async ()=>{
+    const f = fileInput.files[0];
+    if(!f){ alert('Please upload an image of the drawing (PNG/JPG recommended).'); return; }
+    ocrStatus.textContent = 'OCR running — this may take 10–40s depending on image size...';
+    runOcrBtn.disabled = true;
+
+    try {
+      // Tesseract recognize
+      const { createWorker } = Tesseract;
+      const worker = createWorker({
+        logger: m => { /* optional progress */ }
+      });
+      await worker.load();
+      await worker.loadLanguage('eng');
+      await worker.initialize('eng');
+      const {
+        data: { text }
+      } = await worker.recognize(f);
+      await worker.terminate();
+
+      lastOCR = text;
+      ocrTextPre.textContent = text || '{no text found}';
+      ocrStatus.textContent = 'OCR complete';
+      runComplianceChecks(text);
+
+      // parse title block from text
+      const tb = parseTitleBlock(text);
+      titleBlockJson.textContent = JSON.stringify(tb, null, 2);
+
+    } catch (err){
+      console.error(err);
+      ocrStatus.textContent = 'OCR failed: ' + (err.message||err);
+    } finally {
+      runOcrBtn.disabled = false;
+    }
+  });
+
+  function parseTitleBlock(text){
+    // naive regex approach for demo - look for "Project", "Drawing No", "Rev", "Scale", "Date"
+    const tb = {};
+    const lines = (text||'').split('\\n').map(s=>s.trim()).filter(Boolean);
+    for(const l of lines){
+      if(!tb.project && /project[:\\s-]/i.test(l)) tb.project = l.replace(/project[:\\s-]*/i,'').trim();
+      if(!tb.drawingNo && /(drawing|drg|drg. no|drg no|drawing no)[:\\s]/i.test(l)) tb.drawingNo = l;
+      if(!tb.rev && /rev[:\\s]/i.test(l)) tb.rev = (l.match(/rev[:\\s]*([A-Za-z0-9]+)/i)||[])[1] || l;
+      if(!tb.scale && /scale[:\\s]/i.test(l)) tb.scale = l.match(/scale[:\\s]*([0-9:]+)/i)? l.match(/scale[:\\s]*([0-9:]+)/i)[1] : l;
+      if(!tb.date && /date[:\\s]/i.test(l)) tb.date = l;
+    }
+    // fallback: pick last lines as potential titleblock
+    if(!tb.project && lines.length>0) tb.project = lines[0];
+    return tb;
+  }
+
+  function runComplianceChecks(text){
+    const rules = (rulesText.value||'').split('\\n').map(s=>s.trim()).filter(Boolean);
+    if(rules.length===0){
+      summary.innerHTML = '<div class="muted">No rules defined. Paste some rules or click "Load sample rules".</div>';
+      return;
+    }
+    ruleResults.innerHTML = '';
+    let green=0, yellow=0, red=0;
+    rules.forEach(rule=>{
+      const li = document.createElement('div');
+      li.className = 'rule-item';
+      // handle numeric rule e.g., "Corridor width >= 900"
+      const numericMatch = rule.match(/(.+)\\s*(>=|<=|>|<|=)\\s*(\\d+)/);
+      let ok=false, confidence=0;
+      if(numericMatch){
+        // We try to find a number nearby in the OCR text (very naive)
+        const key = numericMatch[1].trim();
+        const op = numericMatch[2];
+        const val = parseInt(numericMatch[3],10);
+        const re = new RegExp(key.split(' ').slice(0,3).join('.*'),'i');
+        const foundLine = (text||'').split('\\n').find(l=>re.test(l));
+        if(foundLine){
+          const numFound = (foundLine.match(/(\\d{2,4})/)||[])[1];
+          if(numFound){
+            const nf = parseInt(numFound,10);
+            switch(op){
+              case '>=': ok = nf >= val; break;
+              case '<=': ok = nf <= val; break;
+              case '>': ok = nf > val; break;
+              case '<': ok = nf < val; break;
+              case '=': ok = nf === val; break;
+            }
+            confidence = 0.8;
+          } else { ok=false; confidence=0.4; }
+        } else { ok=false; confidence=0.2; }
+      } else {
+        // keyword check
+        const re = new RegExp(rule.replace(/[()]/g,''), 'i');
+        ok = re.test(text);
+        confidence = ok?0.9:0.2;
+      }
+      const badge = document.createElement('span');
+      badge.className = 'badge ' + (ok ? 'green' : (confidence>0.5 ? 'yellow' : 'red'));
+      badge.textContent = ok ? 'OK' : (confidence>0.5 ? 'Possible' : 'MISSING');
+      li.innerHTML = `<div>${escapeHtml(rule)}</div>`;
+      li.appendChild(badge);
+      ruleResults.appendChild(li);
+      if(ok) green++; else if(confidence>0.5) yellow++; else red++;
+    });
+
+    summary.innerHTML = `<div><strong>Checks:</strong> <span class="badge green">${green} OK</span> <span class="badge yellow">${yellow} Possible</span> <span class="badge red">${red} Missing</span></div>`;
+  }
+
+  applyTB.addEventListener('click', ()=>{
+    const tb = JSON.parse(titleBlockJson.textContent === '{ }' ? '{}' : titleBlockJson.textContent || '{}');
+    if(tb){
+      if(tbProject.value) tb.project = tbProject.value;
+      if(tbRev.value) tb.rev = tbRev.value;
+      // create downloadable JSON (simulate batch update file)
+      const data = JSON.stringify(tb, null, 2);
+      titleBlockJson.textContent = data;
+      const blob = new Blob([data], {type:'application/json'});
+      const url = URL.createObjectURL(blob);
+      downloadAnchor.innerHTML = `<a class="btn" href="${url}" download="titleblock_update.json">Download titleblock_update.json</a>`;
+    }
+  });
+
+  // small helper
+  function escapeHtml(unsafe) {
+      return unsafe.replace(/[&<"']/g, function(m) {
+          return {'&':'&amp;','<':'&lt;','"':'&quot;',"'":'&#039;'}[m];
+      });
+  }
+</script>
+</body>
+</html>
