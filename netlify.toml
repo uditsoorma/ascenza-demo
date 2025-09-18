@@ -1,5 +1,3 @@
 [build]
-  # Tell Netlify to publish files from the repo root
   publish = "."
-  # No build command needed (just static index.html)
   command = ""
