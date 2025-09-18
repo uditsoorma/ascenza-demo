@@ -1,0 +1,308 @@
+// server.js - ASCENZA rule extractor (DEV_MODE ready + dedupe)
+require('dotenv').config();
+const express = require('express');
+const pdf = require('pdf-parse');
+const multer  = require('multer');
+const fs = require('fs');
+const path = require('path');
+const { v4: uuidv4 } = require('uuid');
+const OpenAI = require('openai');
+
+// OpenAI client (empty key OK for DEV_MODE)
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || '' });
+
+const app = express();
+app.use(express.json({ limit: '30mb' }));
+const upload = multer({ dest: 'uploads/' });
+
+const PORT = process.env.PORT || 3001;
+
+// ensure folders
+fs.mkdirSync(path.join(process.cwd(),'rules'), { recursive: true });
+fs.mkdirSync(path.join(process.cwd(),'uploads'), { recursive: true });
+
+// --- utilities ---
+function chunkText(text, maxChars = 12000) {
+  const paras = text.split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
+  const chunks = [];
+  let buf = '';
+  for (const p of paras) {
+    if ((buf.length + p.length) > maxChars) {
+      chunks.push(buf);
+      buf = p + '\n\n';
+    } else {
+      buf += p + '\n\n';
+    }
+  }
+  if (buf.trim()) chunks.push(buf);
+  return chunks;
+}
+
+function safeParseJSONMaybeArray(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  raw = raw.trim();
+  // try direct parse
+  try { return JSON.parse(raw); } catch(e){ /* continue */ }
+  // try extract first JSON array or object
+  const arrMatch = raw.match(/(\[[\s\S]*\])/m);
+  if (arrMatch) {
+    try { return JSON.parse(arrMatch[1]); } catch(e) {}
+  }
+  const objMatch = raw.match(/(\{[\s\S]*\})/m);
+  if (objMatch) {
+    try { return JSON.parse(objMatch[1]); } catch(e) {}
+  }
+  return null;
+}
+
+// Prompt A: extract candidate clauses that can be automated
+function buildPromptA(chunk) {
+  return `INPUT: Begin with the following building code text delimited by triple backticks:
+\`\`\`
+${chunk}
+\`\`\`
+
+TASK: From the provided text, extract clauses that can be turned into an automated compliance check.
+For each clause produce a JSON object with keys:
+- clause_reference (if present, else empty string)
+- summary (1-sentence human summary)
+- clause_text (exact quoted text)
+- suggested_type (one of: keyword, numeric, presence, spatial, regex, custom)
+- numeric_param (if numeric; else empty)
+- operator (if numeric; e.g., >=, <=, >, <, =, else empty)
+- numeric_value (if numeric; number)
+- keywords (array of expected keywords/phrases for keyword/presence checks)
+- suggested_severity (one of: info, warning, critical)
+
+Return a strict JSON array (no surrounding text) of such objects.`;
+}
+
+// Prompt B: normalize a single clause object into final rule schema
+function buildPromptB(clauseObj, authoritySlug) {
+  return `You are a JSON formatter. Convert the input clause object into the EXACT rule schema JSON.
+AUTHORITY_SLUG: ${authoritySlug}
+INPUT OBJECT:
+${JSON.stringify(clauseObj)}
+
+INSTRUCTIONS:
+- Generate "id" as "${authoritySlug}-" + clause_reference if present, otherwise use a UUID.
+- Map suggested_type to technical_check.type (keyword,numeric,presence,...).
+- Make a best-guess for field_path; use human-readable paths like "plan.dimensions.<param>" or "annotations.<keyword>".
+- Set confidence between 0.3 and 0.98 based on how explicit the clause is (no more than two decimal places).
+- Set human_review_required true for any rule where the clause is ambiguous or requires geometry.
+- Return ONLY the final JSON object. No commentary.`;
+}
+
+// DEV-aware LLM call
+async function runChatCompletion(systemPrompt, userPrompt, max_tokens = 1800) {
+  // DEV MODE deterministic mock — no external API calls
+  if (process.env.DEV_MODE === 'true') {
+    const p = (userPrompt || '').toLowerCase();
+
+    // Prompt A detection (simple heuristic)
+    if (p.includes('from the provided text') || p.includes('extract clauses') || p.includes('turn into an automated compliance check')) {
+      // return two example clause objects
+      return JSON.stringify([
+        {
+          "clause_reference":"EX-1",
+          "summary":"Minimum corridor width 900 mm",
+          "clause_text":"Corridor width shall not be less than 900 mm.",
+          "suggested_type":"numeric",
+          "numeric_param":"corridor width",
+          "operator":">=",
+          "numeric_value":900,
+          "keywords":[],
+          "suggested_severity":"critical"
+        },
+        {
+          "clause_reference":"EX-2",
+          "summary":"Title block must contain revision number and date",
+          "clause_text":"Each drawing shall contain a title block with revision number and date.",
+          "suggested_type":"presence",
+          "numeric_param":"",
+          "operator":"",
+          "numeric_value":"",
+          "keywords":["title block","revision","date"],
+          "suggested_severity":"warning"
+        }
+      ]);
+    }
+
+    // Prompt B (normalizer) - attempt to extract the JSON part and return a normalized object
+    try {
+      const maybeJSON = (userPrompt.match(/(\{[\s\S]*\})/m) || [])[0];
+      const parsed = maybeJSON ? JSON.parse(maybeJSON) : {};
+      const clauseRef = parsed.clause_reference || parsed.clause || 'EX-1';
+      return JSON.stringify({
+        id: `${authoritySlugSafe(parsed.authority || 'DLF')}-${clauseRef}`,
+        authority: parsed.authority || 'DLF',
+        section_title: 'Auto-extracted',
+        clause_reference: clauseRef,
+        short_description: parsed.summary || 'Auto-normalized rule',
+        technical_check: {
+          type: parsed.suggested_type || 'keyword',
+          field_path: parsed.suggested_type === 'numeric' ? 'plan.dimensions.unknown' : 'annotations.title_block',
+          operator: parsed.operator || 'present',
+          value: parsed.numeric_value || null,
+          units: parsed.suggested_type === 'numeric' ? 'mm' : '',
+          example_text_matches: (parsed.keywords && parsed.keywords.length) ? parsed.keywords : [ (parsed.numeric_param || parsed.clause_text || '').slice(0,40) ]
+        },
+        human_review_required: true,
+        severity: parsed.suggested_severity || 'warning',
+        confidence: 0.6,
+        raw_clause_text: parsed.clause_text || parsed.text || '',
+        notes_for_reviewer: 'DEV_MODE mock result — review and update.'
+      });
+    } catch (e) {
+      return JSON.stringify({
+        id: `DLF-MOCK-${uuidv4().slice(0,6)}`,
+        authority: 'DLF',
+        section_title: 'Auto-extracted',
+        clause_reference: 'EX-1',
+        short_description: 'Mock rule',
+        technical_check: {
+          type: 'keyword',
+          field_path: 'annotations.title_block',
+          operator: 'present',
+          value: null,
+          units: '',
+          example_text_matches: ['title block','revision']
+        },
+        human_review_required: true,
+        severity: 'warning',
+        confidence: 0.5,
+        raw_clause_text: 'Mock raw clause',
+        notes_for_reviewer: 'DEV_MODE fallback'
+      });
+    }
+  }
+
+  // Real LLM call (OpenAI client)
+  const model = process.env.OPENAI_MODEL || 'gpt-5';
+  try {
+    const response = await openai.chat.completions.create({
+      model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ],
+      temperature: 0.0,
+      max_tokens,
+    });
+    if (response && response.choices && response.choices[0] && response.choices[0].message) {
+      return response.choices[0].message.content;
+    }
+    return JSON.stringify(response);
+  } catch (err) {
+    console.error('LLM error', err.message || err);
+    throw err;
+  }
+}
+
+function authoritySlugSafe(a) {
+  return String(a || 'UNKNOWN').replace(/\s+/g,'_').toUpperCase();
+}
+
+// process text -> rules (includes dedupe)
+async function processTextToRules(text, authority) {
+  const slug = authoritySlugSafe(authority);
+  const chunks = chunkText(text, 11000);
+  const extractedClauses = [];
+
+  for (const chunk of chunks) {
+    const sys = 'You are a building code analyst. Output strict JSON only.';
+    const promptA = buildPromptA(chunk);
+    const raw = await runChatCompletion(sys, promptA, 2000);
+
+    const arr = safeParseJSONMaybeArray(raw) || [];
+    for (const c of arr) {
+      // attach source chunk preview so normalizer has context
+      extractedClauses.push(Object.assign({}, c, { _source_preview: chunk.slice(0,200) }));
+    }
+  }
+
+  // Normalize each clause (Prompt B)
+  const normalized = [];
+  for (const c of extractedClauses) {
+    const promptB = buildPromptB(c, slug);
+    const sysB = 'You are a strict JSON normalizer. Output JSON only.';
+    const rawB = await runChatCompletion(sysB, promptB, 1000);
+    const obj = safeParseJSONMaybeArray(rawB) || safeParseJSONMaybeArray(rawB) || null;
+    // obj might be an array or object - handle object
+    const norm = Array.isArray(obj) ? obj[0] : obj;
+    if (!norm) continue;
+    // ensure necessary fields
+    if (!norm.id) norm.id = `${slug}-${(norm.clause_reference || uuidv4().slice(0,6))}`;
+    if (!norm.authority) norm.authority = slug;
+    normalized.push(norm);
+  }
+
+  // Dedupe: by id and by signature (clause_reference + raw_clause_text snippet)
+  const seenIds = new Set();
+  const seenSign = new Set();
+  const deduped = [];
+  for (const r of normalized) {
+    const id = String(r.id || '').trim();
+    const sign = `${(r.clause_reference||'').trim()}|${String((r.raw_clause_text||'').slice(0,120)).trim()}`;
+    if (id && seenIds.has(id)) continue;
+    if (seenSign.has(sign)) continue;
+    if (id) seenIds.add(id);
+    seenSign.add(sign);
+    deduped.push(r);
+  }
+
+  // write to file
+  const outPath = path.join(process.cwd(), 'rules', `${slug}.json`);
+  fs.writeFileSync(outPath, JSON.stringify(deduped, null, 2), 'utf8');
+  return { count: deduped.length, file: outPath, rules: deduped };
+}
+
+/* API endpoints */
+
+// POST JSON: { pdf_url: "https://..." , authority: "DLF" }
+app.post('/extract-from-url', async (req, res) => {
+  try {
+    const { pdf_url, authority = 'UNKNOWN' } = req.body;
+    if (!pdf_url) return res.status(400).json({ error: 'pdf_url required' });
+    const buf = await (await fetch(pdf_url)).arrayBuffer();
+    const text = await pdf(Buffer.from(buf));
+    const result = await processTextToRules(text.text || '', authority);
+    return res.json(result);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
+// Upload file form-data field name 'file'
+app.post('/extract-from-file', upload.single('file'), async (req, res) => {
+  try {
+    const authority = req.body.authority || 'UNKNOWN';
+    const filePath = req.file.path;
+    const buffer = fs.readFileSync(filePath);
+    const data = await pdf(buffer);
+    const text = data.text || '';
+    // remove file immediately
+    try { fs.unlinkSync(filePath); } catch(e) {}
+    const result = await processTextToRules(text, authority);
+    return res.json(result);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
+// GET rules: ?authority=DLF
+app.get('/rules', (req, res) => {
+  const authority = (req.query.authority || 'UNKNOWN');
+  const filePath = path.join(process.cwd(), 'rules', `${authoritySlugSafe(authority)}.json`);
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'rules not found', file: filePath });
+  const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  return res.json({ authority: authoritySlugSafe(authority), count: data.length, rules: data });
+});
+
+// health
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
+const port = PORT;
+app.listen(port, () => console.log(`rule-extractor listening on ${port}`));

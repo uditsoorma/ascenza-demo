@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>ASCENZA Demo — Rule Extractor & Checker</title>
+<style>
+  body { font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, Arial; margin: 28px; color:#111; }
+  h1{margin:0 0 12px 0}
+  .panel { border:1px solid #e6e6e6; padding:16px; border-radius:8px; margin-bottom:16px; background:#fff; }
+  input[type="file"]{ display:block; margin-top:8px; }
+  button{ padding:10px 14px; border-radius:8px; border:none; background:#0a84ff; color:#fff; cursor:pointer; }
+  button.secondary{ background:#f0f0f0; color:#111; }
+  .rules-list{ margin-top:12px; }
+  .rule { padding:10px; border-radius:6px; margin-bottom:8px; border:1px solid #eee; display:flex; justify-content:space-between; background:#fafafa }
+  .pass{ color: #0a8a00; font-weight:600 }
+  .fail{ color: #c62828; font-weight:600 }
+  .small{ font-size:13px; color:#555 }
+  .flex { display:flex; gap:10px; align-items:center }
+</style>
+</head>
+<body>
+  <h1>ASCENZA — Compliance Demo</h1>
+  <p class="small">Upload guideline PDF (DLF/NBC) to extract rules, then upload a drawing PDF to run checks (DEV_MODE by default).</p>
+
+  <div class="panel">
+    <strong>1. Upload guideline PDF (extract rules)</strong>
+    <div class="small">Authority:</div>
+    <input id="guid-authority" value="DLF" style="margin-bottom:8px;padding:8px;border-radius:6px;border:1px solid #ddd" />
+    <input id="guid-file" type="file" accept=".pdf" />
+    <div style="margin-top:8px">
+      <button id="btn-extract">Extract Rules</button>
+    </div>
+    <div id="guid-status" style="margin-top:10px"></div>
+    <div id="rules" class="rules-list"></div>
+  </div>
+
+  <div class="panel">
+    <strong>2. Upload drawing PDF (run checks)</strong>
+    <div class="small">Use same authority as above</div>
+    <input id="draw-file" type="file" accept=".pdf" />
+    <div style="margin-top:8px">
+      <button id="btn-check" class="secondary">Run Checks</button>
+    </div>
+    <div id="check-status" style="margin-top:10px"></div>
+    <div id="results" style="margin-top:12px"></div>
+  </div>
+
+  <script>
+  // helper
+  function el(id){return document.getElementById(id)}
+  let latestRules = [];
+
+  // render rules list
+  function renderRules(rules){
+    latestRules = rules || [];
+    const out = rules.map(r => {
+      const short = r.short_description || (r.technical_check && r.technical_check.type) || 'rule';
+      return `<div class="rule">
+        <div>
+          <div style="font-weight:700">${r.id} — ${short}</div>
+          <div class="small">Severity: ${r.severity} • review_required: ${r.human_review_required}</div>
+        </div>
+        <div style="text-align:right">
+          <div class="small">${(r.technical_check && r.technical_check.type) || ''}</div>
+        </div>
+      </div>`;
+    }).join('');
+    el('rules').innerHTML = out || '<div class="small">No rules loaded. Upload a guideline first.</div>';
+  }
+
+  // extraction handler
+  el('btn-extract').onclick = async () => {
+    const file = el('guid-file').files[0];
+    const authority = el('guid-authority').value || 'DLF';
+    if(!file){ alert('Choose a guideline PDF first'); return; }
+    el('guid-status').innerText = 'Uploading and extracting rules...';
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('authority', authority);
+
+    try {
+      const res = await fetch('/extract-from-file', { method:'POST', body: fd });
+      const json = await res.json();
+      if(res.ok){
+        el('guid-status').innerText = `Extracted ${json.count} rules — saved: ${json.file}`;
+        renderRules(json.rules || []);
+      } else {
+        el('guid-status').innerText = 'Error: ' + (json.error || JSON.stringify(json));
+      }
+    } catch(err){
+      el('guid-status').innerText = 'Network error: ' + err.message;
+    }
+  };
+
+  // check handler
+  el('btn-check').onclick = async () => {
+    const file = el('draw-file').files[0];
+    const authority = el('guid-authority').value || 'DLF';
+    if(!file){ alert('Choose a drawing PDF first'); return; }
+    el('check-status').innerText = 'Uploading drawing and running checks...';
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('authority', authority);
+
+    try {
+      const res = await fetch('/check-drawing', { method:'POST', body: fd });
+      const json = await res.json();
+      if(res.ok){
+        el('check-status').innerText = `Checks completed — ${json.results.length} rules evaluated.`;
+        renderResults(json.results);
+      } else {
+        el('check-status').innerText = 'Error: ' + (json.error || JSON.stringify(json));
+      }
+    } catch(err){
+      el('check-status').innerText = 'Network error: ' + err.message;
+    }
+  };
+
+  // display results
+  function renderResults(results){
+    if(!results || !results.length){ el('results').innerHTML = '<div class="small">No results</div>'; return; }
+    const out = results.map(r => {
+      const ok = r.ok;
+      const right = ok ? `<div class="pass">PASS</div>` : `<div class="fail">FAIL</div>`;
+      let detail='';
+      if(r.type === 'numeric'){
+        detail = `<div class="small">required: ${r.required} mm • found: ${ (r.matched && r.matched.length) ? r.matched.map(m=>m.token+' ('+Math.round(m.foundMm)+'mm)').join(', ') : 'none' }</div>`;
+      } else if(r.type === 'presence'){
+        detail = `<div class="small">foundMatches: ${ (r.foundMatches||[]).join(', ') }</div>`;
+      }
+      return `<div class="rule">
+        <div>
+          <div style="font-weight:700">${r.id} — ${r.rule.short_description}</div>
+          ${detail}
+        </div>
+        <div style="text-align:right">
+          ${right}
+        </div>
+      </div>`;
+    }).join('');
+    el('results').innerHTML = out;
+  }
+
+  // onload: show note
+  document.addEventListener('DOMContentLoaded', ()=> {
+    el('rules').innerHTML = '<div class="small">No rules loaded — upload a guideline to start.</div>';
+  });
+  </script>
+</body>
+</html>
